@@ -1,0 +1,332 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# mic-712-ox -- carrier control + bring-up CLI for the Advantech MIC-712-OX
+# (Jetson Orin NX). Single entry point for the board's PoE, GPIO, CAN, audio,
+# mini-PCIe and MCU bits. The boot-time systemd units (mic-712-ox-*.service)
+# shell into the subcommands below; everything is equally usable by hand.
+#
+# Reimplemented cleanly for Avocado OS from forensics on the factory image
+# (Advantech's own /opt/advantech scripts are proprietary). Uses libgpiod v2
+# (gpioset/gpioget) and i2c-tools.
+set -euo pipefail
+
+# ---- config -----------------------------------------------------------------
+# Overridable via /etc/default/mic-712-ox or the environment.
+[ -r /etc/default/mic-712-ox ] && . /etc/default/mic-712-ox
+
+POE_BUS="${MIC712_POE_BUS:-1}"          # IP808 PSE i2c bus
+POE_ADDR="${MIC712_POE_ADDR:-0x74}"     # IP808 PSE slave address
+CAN_IFACES="${MIC712_CAN_IFACES:-can0}" # space-separated; add can1 if used
+CAN_BITRATE="${MIC712_CAN_BITRATE:-125000}"
+AUDIO_CARD="${MIC712_AUDIO_CARD:-APE}"
+AUDIO_IF="${MIC712_AUDIO_IF:-I2S4}"     # Orin NX routes rt5640 on I2S4
+# Fan sync: SoC thermal governor only drives the primary fan; mirror its PWM
+# onto the secondary so both spin together.
+FAN_SRC="${MIC712_FAN_SRC:-/sys/devices/platform/pwm-fan/hwmon/hwmon*/pwm1}"
+FAN_DST="${MIC712_FAN_DST:-/sys/devices/platform/pwm5-fan/hwmon/hwmon*/pwm1}"
+FAN_INTERVAL="${MIC712_FAN_INTERVAL:-1}"
+
+# SoC GPIO lines (gpiochip0 unless noted). Derived from the shipped MB1 pinmux:
+#   MCU_PROG_EN = soc_gpio32_pq5 = PQ.05,  MCU1_RST = soc_gpio25_pp6 = PP.06.
+MCU_PROG_EN_LINE="${MIC712_MCU_PROG_EN_LINE:-PQ.05}"
+MCU_RST_LINE="${MIC712_MCU_RST_LINE:-PP.06}"
+MPCIE_RST_LINE="${MIC712_MPCIE_RST_LINE:-PK.03}"
+
+log() { echo "mic-712-ox: $*" >&2; }
+die() { log "$*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# =============================================================================
+# PoE -- 8-port IP808AR PSE on i2c (no kernel driver; SMBus byte ops)
+# =============================================================================
+_poe_w() { i2cset -y "$POE_BUS" "$POE_ADDR" "$@"; }
+_poe_r() { i2cget -y "$POE_BUS" "$POE_ADDR" "$@"; }
+_poe_page() { _poe_w 0x00 "$1"; }                 # 0x00=page0, 0x40=page1
+_poe_present() { _poe_r 0x00 >/dev/null 2>&1; }
+
+poe_init() {
+	for _ in $(seq 1 30); do _poe_present && break; sleep 1; done
+	_poe_present || die "IP808 PSE not responding at ${POE_BUS}/${POE_ADDR}"
+	# soft reset
+	_poe_page 0x40; _poe_w 0x02 0x01; sleep 2
+	# global config: unmask status sources, 150 W budget, total-current limit
+	_poe_page 0x00
+	local r
+	for r in 0xbf 0xc0 0xc1 0xc2 0xc3 0xc4 0xc5 0xc6 0xc7 0xc8 0xc9 0xca 0xcc 0xcd 0xce; do
+		_poe_w "$r" 0xff
+	done
+	_poe_w 0x00 0x44; _poe_w 0x06 0xf5; _poe_w 0xe3 0x21
+	_poe_w 0xc0 0x82          # enable total-current limit
+	_poe_w 0x54 0x2b; _poe_w 0x55 0x64   # 150 W (hi,lo)
+	_poe_w 0x00 0x04
+	# per-port power: disable all, then enable all (regs 0x98..0x9f on page1)
+	_poe_page 0x40
+	for r in 0x98 0x99 0x9a 0x9b 0x9c 0x9d 0x9e 0x9f; do _poe_w "$r" 0x00; done
+	sleep 2
+	for r in 0x98 0x99 0x9a 0x9b 0x9c 0x9d 0x9e 0x9f; do _poe_w "$r" 0x01; done
+	_poe_page 0x00; _poe_w 0xe3 0x3f     # arm per-port state machines
+	log "PoE: 8 ports enabled (IP808 @ ${POE_BUS}/${POE_ADDR})"
+}
+
+_poe_port_reg() { printf '0x%x' $((0x98 + $1)); }   # port 0..7 -> 0x98..0x9f
+
+poe_port() {       # poe_port <0-7> <0|1>
+	local p="$1" v="$2"
+	[ "$p" -ge 0 ] && [ "$p" -le 7 ] || die "port must be 0..7"
+	_poe_page 0x40; _poe_w "$(_poe_port_reg "$p")" "$((v))"
+}
+
+poe_all() {        # poe_all <0|1>
+	local p; for p in 0 1 2 3 4 5 6 7; do poe_port "$p" "$1"; done
+}
+
+poe_status() {
+	_poe_page 0x40
+	local p reg st
+	for p in 0 1 2 3 4 5 6 7; do
+		reg=$(_poe_port_reg "$p"); st=$(_poe_r "$reg")
+		printf "port %d: %s\n" "$p" "$([ "$st" = 0x01 ] && echo enabled || echo disabled)"
+	done
+}
+
+# =============================================================================
+# GPIO -- libgpiod v2. The Advantech DTB bakes direction hints into the
+# gpio-line-names ("CAN_RST, IN", "COM1_EN,OUT,H", ...), so we can't match a
+# bare name. _gpio_resolve matches on the part before the first comma and
+# returns "<chip> <offset>". tca9554 expander outputs latch in-chip (persist
+# after gpioset exits); SoC lines need a holder (see mcu).
+# =============================================================================
+_gpio_resolve() {  # <name-prefix> -> "<chip> <offset>" (empty if not found)
+	gpioinfo 2>/dev/null | awk -v want="$1" '
+		/^gpiochip/ { chip=$1; next }
+		/^[ \t]*line[ \t]+[0-9]+:/ {
+			o=$2; sub(/:/,"",o)
+			if (match($0,/"[^"]*"/)) {
+				nm=substr($0,RSTART+1,RLENGTH-2); sub(/,.*/,"",nm)
+				gsub(/^[ \t]+|[ \t]+$/,"",nm)
+				if (nm==want) { print chip, o; exit }
+			}
+		}'
+}
+# Drop any daemonized holder of a specific <chip> <off> (glob over /proc, so
+# busybox's limited pkill regex isn't involved). gpioset's daemon renders its
+# args as "... -c <chip> <off> <val>".
+_gpio_drop_holder() {
+	local p cl
+	for p in $(pgrep gpioset 2>/dev/null); do
+		cl=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
+		case "$cl" in
+			*"-c $1 $2 "*|*"-c $1 $2="*) kill -9 "$p" 2>/dev/null || true ;;
+		esac
+	done
+}
+gpio_set() {  # <name> <0|1> -- drive + hold the line
+	local chip off; read -r chip off < <(_gpio_resolve "$1")
+	[ -n "$off" ] || { log "gpio line '$1' not found"; return 1; }
+	# libgpiod v2 gpioset holds the line until it exits, so the right idiom for
+	# persistent control is --daemonize: it completes the (slow, can-sleep) i2c
+	# write to the tca9554, detaches, and keeps the value driven. We do NOT kill
+	# it mid-transaction -- that can wedge the expander line in the kernel.
+	# Drop any prior holder of this exact line first so re-sets don't EBUSY.
+	_gpio_drop_holder "$chip" "$off"
+	sleep 0.2
+	gpioset --consumer mic-712-ox --daemonize -c "$chip" "$off=$2"
+}
+gpio_get() {  # <name>
+	local chip off; read -r chip off < <(_gpio_resolve "$1")
+	[ -n "$off" ] || { log "gpio line '$1' not found"; return 1; }
+	gpioget --consumer mic-712-ox -c "$chip" "$off"
+}
+gpio_hold() {  # daemonize + hold a held-output line by name (SoC lines)
+	local chip off; read -r chip off < <(_gpio_resolve "$1")
+	[ -n "$off" ] || { log "gpio line '$1' not found"; return 1; }
+	gpioset --consumer "${3:-mic-712-ox}" --daemonize -c "$chip" "$off=$2"
+}
+
+# =============================================================================
+# CAN -- mttcan; release transceiver, set bitrate, bring up.
+# Setting the CAN bitrate is a netlink link operation that ONLY iproute2's ip
+# can do -- BusyBox ip ("type" is garbage / SIOCSIFFLAGS) cannot. _can_ip finds
+# a real iproute2 ip (the avocado base ships busybox ip; iproute2 comes from
+# this extension's package list).
+# =============================================================================
+_can_ip() {  # echo an iproute2-capable ip(8), or fail
+	local c
+	for c in ip ip.iproute2 /usr/sbin/ip.iproute2 /sbin/ip.iproute2; do
+		if command -v "$c" >/dev/null 2>&1 && "$c" -V 2>/dev/null | grep -qi iproute2; then
+			command -v "$c"; return 0
+		fi
+	done
+	return 1
+}
+can_up() {
+	# CAN_RST / CAN_TX_EN are tca9554 lines -> values latch in the expander.
+	gpio_set CAN_RST 1   || log "CAN_RST: skipped"
+	gpio_set CAN_TX_EN 0 || log "CAN_TX_EN: skipped"
+	# Load each module separately (-a); `modprobe can can_raw mttcan` would treat
+	# can_raw/mttcan as *parameters* to the can module.
+	modprobe -a -q can can_raw can_dev mttcan nvpps 2>/dev/null || true
+	local IP; IP=$(_can_ip) || { log "CAN: iproute2 ip not found (busybox ip can't set CAN bitrate); add iproute2"; return 1; }
+	local i
+	for i in $CAN_IFACES; do
+		[ -e "/sys/class/net/$i" ] || { log "CAN: $i absent"; continue; }
+		"$IP" link set "$i" down 2>/dev/null || true
+		if "$IP" link set "$i" type can bitrate "$CAN_BITRATE" sjw 1 loopback off; then
+			"$IP" link set "$i" up && log "CAN: $i up @ ${CAN_BITRATE} bps" || log "CAN: $i up failed"
+		else
+			log "CAN: $i bitrate config failed"
+		fi
+	done
+}
+can_down() { local IP i; IP=$(_can_ip || echo ip); for i in $CAN_IFACES; do "$IP" link set "$i" down 2>/dev/null || true; done; }
+
+# =============================================================================
+# Audio -- route rt5640 codec onto the I2S4 DAI (playback + capture)
+# =============================================================================
+audio_setup() {
+	have amixer || die "amixer (alsa-utils) not installed"
+	# The rt5640 analog path lives on the Tegra APE audio-graph-card. On the
+	# avocado 6.6 kernel the Advantech (R36.4.3) audio-graph DT node fails to
+	# register (ASoC -EBUSY parse error -- a vendor-DTB/kernel version skew), so
+	# the APE card may be absent (only the HDA/HDMI card exists). Detect it and
+	# skip cleanly rather than spamming amixer "Invalid card number" errors.
+	if ! amixer -c "${AUDIO_CARD}" info >/dev/null 2>&1; then
+		log "audio: '${AUDIO_CARD}' card not present (rt5640 audio-graph card not registered); skipping"
+		return 0
+	fi
+	local m="amixer -c ${AUDIO_CARD} cset name="
+	# wait for the rt5640 DAPM widgets to appear
+	local i
+	for i in $(seq 1 10); do
+		[ -d "/sys/kernel/debug/asoc" ] && break; sleep 1
+	done
+	${m}"${AUDIO_IF} Mux" "ADMAIF1"            || true
+	${m}"ADMAIF1 Mux" "${AUDIO_IF}"            || true
+	${m}"CVB-RT DAI select" "1:1|2:2"          || true
+	${m}"CVB-RT DAC MIXL INF1 Switch" 1        || true
+	${m}"CVB-RT DAC MIXR INF1 Switch" 1        || true
+	${m}"CVB-RT Stereo DAC MIXL DAC L1 Switch" 1 || true
+	${m}"CVB-RT Stereo DAC MIXR DAC R1 Switch" 1 || true
+	${m}"CVB-RT OUT MIXL DAC L1 Switch" 1      || true
+	${m}"CVB-RT OUT MIXR DAC R1 Switch" 1      || true
+	${m}"CVB-RT LOUT MIX OUTVOL L Switch" 1    || true
+	${m}"CVB-RT LOUT MIX OUTVOL R Switch" 1    || true
+	${m}"CVB-RT OUT Channel Switch" 1          || true
+	${m}"CVB-RT OUT Playback Switch" 1         || true
+	# stereo mic capture
+	${m}"CVB-RT RECMIXL BST1 Switch" on        || true
+	${m}"CVB-RT RECMIXR BST2 Switch" on        || true
+	${m}"CVB-RT IN1 Boost" 8                   || true
+	${m}"CVB-RT IN2 Boost" 8                   || true
+	${m}"CVB-RT Stereo ADC1 Mux" ADC           || true
+	${m}"CVB-RT Stereo ADC MIXL ADC1 Switch" on || true
+	${m}"CVB-RT Stereo ADC MIXR ADC1 Switch" on || true
+	log "audio: rt5640 routed on ${AUDIO_IF}"
+}
+
+# =============================================================================
+# mini-PCIe -- reset pulse (e.g. to kick a cellular modem that didn't enumerate)
+# =============================================================================
+mpcie_reset() {
+	gpio_set "$MPCIE_RST_LINE" 0 || die "$MPCIE_RST_LINE not found"
+	sleep 0.5
+	gpio_set "$MPCIE_RST_LINE" 1
+	log "mini-PCIe: pulsed reset on $MPCIE_RST_LINE"
+}
+
+# =============================================================================
+# MCU (Nuvoton M031) -- OFF BY DEFAULT. The factory drives MCU_PROG_EN and
+# MCU1_RST low and holds them via a daemon; semantics are board-specific and
+# the MCU's role isn't required for NICs/PoE/CAN/audio, so we don't touch it
+# unless asked. `enable` holds both lines low (matching factory); `release`
+# frees them.
+# =============================================================================
+mcu_enable() {
+	pkill -f "gpioset.*mic-712-ox-mcu" 2>/dev/null || true
+	# Hold both MCU lines low for the system lifetime (daemonized, one per line).
+	gpio_hold "$MCU_PROG_EN_LINE" 0 mic-712-ox-mcu || true
+	gpio_hold "$MCU_RST_LINE" 0 mic-712-ox-mcu || true
+	log "MCU: holding ${MCU_PROG_EN_LINE}=0 ${MCU_RST_LINE}=0"
+}
+mcu_release() { pkill -f "gpioset.*mic-712-ox-mcu" 2>/dev/null || true; log "MCU: released"; }
+
+# =============================================================================
+# Fan sync
+# =============================================================================
+_fan_first() { local g; for g in $1; do [ -e "$g" ] && { echo "$g"; return; }; done; }
+fan_sync_once() {
+	local src dst; src=$(_fan_first "$FAN_SRC"); dst=$(_fan_first "$FAN_DST")
+	[ -n "$src" ] && [ -w "${dst:-/nonexistent}" ] || return 0
+	cat "$src" > "$dst" 2>/dev/null || true
+}
+fan_sync_loop() { while :; do fan_sync_once; sleep "$FAN_INTERVAL"; done; }
+
+# =============================================================================
+# carrier-init -- the boot bring-up (CAN transceiver + interface + audio).
+# MCU / mini-PCIe are deliberately NOT run here (opt-in via their subcommands).
+# =============================================================================
+carrier_init() {
+	can_up || log "CAN bring-up incomplete"
+	[ "${MIC712_ENABLE_MCU:-0}" = "1" ] && mcu_enable || true
+	log "carrier-init done"
+}
+
+usage() {
+	cat >&2 <<'EOF'
+Usage: mic-712-ox <command> [args]
+
+  poe init                 reset + configure the IP808 PSE, enable all 8 ports
+  poe status               show per-port enable state
+  poe on  [PORT]           enable PoE on PORT (0-7), or all if omitted
+  poe off [PORT]           disable PoE on PORT (0-7), or all if omitted
+
+  gpio get  <NAME>         read a GPIO line by name (e.g. CAN_RST)
+  gpio set  <NAME> <0|1>   set a GPIO line by name (expander lines latch)
+
+  can up [iface] [bitrate] release transceiver, bring CAN up (default can0/125k)
+  can down [iface]
+
+  audio                    route the rt5640 codec onto I2S4
+  mpcie-reset              pulse the mini-PCIe reset line
+  mcu enable|release       (advanced) hold/free the M031 MCU lines
+  fan-sync [--daemon]      mirror primary fan PWM onto the secondary
+  carrier-init             boot bring-up (CAN + audio); used by systemd
+EOF
+	exit 2
+}
+
+# ---- dispatch ---------------------------------------------------------------
+cmd="${1:-}"; shift || true
+case "$cmd" in
+	poe)
+		sub="${1:-}"; shift || true
+		case "$sub" in
+			init) poe_init ;;
+			status) poe_status ;;
+			on)  [ $# -ge 1 ] && poe_port "$1" 1 || poe_all 1 ;;
+			off) [ $# -ge 1 ] && poe_port "$1" 0 || poe_all 0 ;;
+			*) usage ;;
+		esac ;;
+	gpio)
+		sub="${1:-}"; shift || true
+		case "$sub" in
+			get) gpio_get "$1" ;;
+			set) gpio_set "$1" "$2" ;;
+			*) usage ;;
+		esac ;;
+	can)
+		sub="${1:-}"; shift || true
+		case "$sub" in
+			up) [ $# -ge 1 ] && CAN_IFACES="$1"; [ $# -ge 2 ] && CAN_BITRATE="$2"; can_up ;;
+			down) [ $# -ge 1 ] && CAN_IFACES="$1"; can_down ;;
+			*) usage ;;
+		esac ;;
+	audio) audio_setup ;;
+	mpcie-reset) mpcie_reset ;;
+	mcu)
+		case "${1:-}" in enable) mcu_enable ;; release) mcu_release ;; *) usage ;; esac ;;
+	fan-sync) [ "${1:-}" = "--daemon" ] && fan_sync_loop || fan_sync_once ;;
+	carrier-init) carrier_init ;;
+	*) usage ;;
+esac

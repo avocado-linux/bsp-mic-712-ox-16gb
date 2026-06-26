@@ -1,0 +1,15 @@
+[Unit]
+Description=MIC-712-OX dual-fan PWM sync
+Documentation=https://github.com/avocadolinux/avocado-os
+# The SoC thermal governor only drives the primary pwm-fan; mirror its duty
+# cycle onto the secondary (pwm5-fan) so both fans track temperature.
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/mic-712-ox fan-sync --daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

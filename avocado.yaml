@@ -1,0 +1,234 @@
+default_target: jetson-orin-nx
+supported_targets:
+  - jetson-orin-nx
+
+extensions:
+  avocado-bsp-mic-712-ox-16gb:
+    version: 0.1.0
+    release: r0
+    summary: Board support for the Advantech MIC-712-OX (carrier extension on jetson-orin-nx)
+    description: |
+      Layered carrier support for the Advantech MIC-712-OX AI edge / PoE
+      gateway on top of the generic jetson-orin-nx target (Jetson Orin NX
+      P3767-0000 16GB SOM on Advantech's P3768-class carrier, flashed in
+      "super" mode). Reproduces what Advantech's factory BSP
+      (MIC-712_OrinNX_6.2.0_V1.0.3, L4T R36.4.3) provides, via the
+      carrier-bsp overlay + carrier.env and a runtime package/overlay set.
+
+      Carrier I/O the MIC-712-OX adds over a bare Orin NX devkit:
+        * 8x GbE: 1x Intel I210 (eth0, management) + 6x Intel I350 behind an
+          ASMedia ASM1806 PCIe switch (eth1-6, the PoE ports) + 1x Realtek
+          RTL8168 (eth7). The I210/I350 use the in-tree igb driver; the
+          Realtek uses r8169.
+        * 8-port PoE/PoE+ PSE: an IP808AR PSE manager on i2c-1 @ 0x74. No
+          kernel driver -- configured from userspace. mic-712-ox-poe.service
+          (overlay) arms all 8 ports at boot, mirroring the factory image.
+        * 2x CAN (mttcan, c310000/c320000).
+        * 3x TI tca9554 GPIO expanders (i2c 0/1/7 @ 0x20): camera control,
+          RS-232/422/485 transceiver enables + mode/termination, CAN reset,
+          and the IP808 SMBus select line.
+        * realtek,rt5640 audio codec (i2c0 @ 0x1c) + ti,ina3221 rail monitor
+          (i2c1 @ 0x40).
+
+      Provisioning deltas vs. stock L4T (taken from the extracted Advantech
+      BSP, renamed -adv) live in stone/carrier-bsp/: the kernel DTB, the
+      super BPMP DTB + TE980M firmware, and the Advantech-modified MB1
+      pinmux + GPIO BCT. CARRIER_FV_CHECK_BOARDID/CHECK_BOARDSKU pin this
+      extension to the P3767-0000 SOM so a wrong Orin NX/Nano SKU fails fast
+      at the tegraflash boardid check. See stone/carrier-bsp/carrier.env.
+    license: Apache-2.0
+    url: https://github.com/avocadolinux/avocado-os
+    vendor: Avocado Linux <info@avocadolinux.org>
+
+    types:
+      - sysext
+      - confext
+
+    package_files:
+      - overlay
+      - stone
+      - avocado.yaml
+
+    # Carrier overlay files for the MIC-712-OX live under stone/. avocado-cli
+    # composes the path below into the runtime's effective
+    # AVOCADO_STONE_INCLUDE_PATHS, scoped to this extension's location (so
+    # remote consumers find the carrier files at
+    # $AVOCADO_PREFIX/includes/avocado-bsp-mic-712-ox-16gb/stone/).
+    stone_include_paths:
+      - stone
+
+    # Confext overlay — ships /etc/hostname (mic-712-ox), the PoE bring-up
+    # script, and its systemd unit.
+    overlay: overlay
+
+    modprobe:
+      - gpio-pca953x
+      - mttcan
+
+    # Boot-time carrier bring-up, all driven by the /usr/bin/mic-712-ox CLI:
+    #   poe          -- arm the 8 IP808 PSE ports (volatile, re-run every boot)
+    #   carrier-init -- release the CAN transceiver + bring CAN up
+    #   fan-sync     -- mirror the primary fan PWM onto the secondary
+    #   audio        -- route the rt5640 codec (best-effort; analog audio only)
+    # mic-712-ox-mcu.service is intentionally NOT enabled (advanced/opt-in; see
+    # /etc/default/mic-712-ox and the unit header).
+    enable_services:
+      - mic-712-ox-poe.service
+      - mic-712-ox-carrier-init.service
+      - mic-712-ox-fan-sync.service
+      - mic-712-ox-audio.service
+
+    on_merge:
+      - hostname -F /etc/hostname
+      - systemctl start --no-block mic-712-ox-poe.service
+      - systemctl start --no-block mic-712-ox-carrier-init.service
+      - systemctl start --no-block mic-712-ox-fan-sync.service
+      - udevadm control --reload
+      - udevadm trigger --type=subsystems --action=add --settle
+      - udevadm trigger --type=devices --action=add --settle
+      - nvbootctrl verify
+
+    on_unmerge:
+      - systemctl stop mic-712-ox-poe.service
+      - systemctl stop mic-712-ox-carrier-init.service
+      - systemctl stop mic-712-ox-fan-sync.service
+
+    # Modeled on bsp/icam-540/avocado.yaml (the other Orin NX carrier), with
+    # MIC-712-OX-specific additions: igb (I210/I350 NICs), the CAN stack
+    # (mttcan), the rt5640 audio codec, the SPI TPM, and the i2c-tools the
+    # PoE service shells out to. Kernel-module names are the same in both the
+    # linux-yocto 6.6 (default) and linux-jammy-nvidia-tegra 5.15 feeds.
+    packages:
+      # --- Carrier networking ------------------------------------------------
+      kernel-module-igb: '*'          # Intel I210 (eth0) + 6x I350 (eth1-6, PoE)
+      kernel-module-r8169: '*'        # Realtek RTL8168 (eth7)
+      kernel-module-realtek: '*'      # Realtek PHY
+      # --- CAN (2x mttcan) ---------------------------------------------------
+      kernel-module-mttcan: '*'
+      kernel-module-can: '*'
+      kernel-module-can-dev: '*'
+      kernel-module-can-raw: '*'
+      kernel-module-nvpps: '*'        # mttcan pulls in nvpps
+      # --- Carrier I2C / GPIO / audio / sensors ------------------------------
+      kernel-module-gpio-pca953x: '*' # 3x ti,tca9554 expanders
+      kernel-module-at24: '*'         # carrier EEPROMs
+      kernel-module-ina3221: '*'      # rail monitor
+      kernel-module-snd-soc-rt5640: '*'
+      kernel-module-snd-soc-rl6231: '*'
+      kernel-module-tpm-tis-spi: '*'  # onboard TPM on SPI
+      # Userspace the mic-712-ox CLI / services shell out to:
+      i2c-tools: '*'                  # i2cset/i2cget -- IP808 PoE control
+      libgpiod-tools: '*'             # gpioset/gpioget v2 -- CAN transceiver, MCU, mPCIe
+      iproute2: '*'                   # real `ip` -- CAN bitrate (busybox ip can't)
+      alsa-utils-amixer: '*'          # amixer -- rt5640 audio routing
+      can-utils: '*'                  # candump/cansend -- CAN convenience
+
+      # --- Orin NX SOM base set
+      kernel-module-cec: '*'
+      kernel-module-crct10dif-ce: '*'
+      kernel-module-drm-dp-aux-bus: '*'
+      kernel-module-fusb301: '*'
+      kernel-module-ghash-ce: '*'
+      kernel-module-governor-pod-scaling: '*'
+      kernel-module-governor-userspace: '*'
+      kernel-module-gpio-keys: '*'
+      nv-kernel-module-host1x: '*'
+      kernel-module-host1x-fence: '*'
+      kernel-module-host1x-nvhost: '*'
+      kernel-module-mc-hwpm: '*'
+      kernel-module-mc-utils: '*'
+      kernel-module-nvgpu: '*'
+      kernel-module-nvhost-nvdla: '*'
+      kernel-module-nvhost-pva: '*'
+      kernel-module-nvhwpm: '*'
+      kernel-module-nvidia: '*'
+      kernel-module-nvidia-drm: '*'
+      kernel-module-nvidia-modeset: '*'
+      kernel-module-nvidia-vrs-pseq: '*'
+      kernel-module-nvmap: '*'
+      kernel-module-nvme: '*'
+      kernel-module-nvme-core: '*'
+      kernel-module-nvpmodel-clk-cap: '*'
+      kernel-module-nvsciipc: '*'
+      kernel-module-nvvrs-pseq-rtc: '*'
+      kernel-module-pcie-tegra194: '*'
+      kernel-module-phy-tegra194-p2u: '*'
+      kernel-module-pwm-fan: '*'
+      kernel-module-pwm-tegra: '*'
+      kernel-module-pwm-tegra-tachometer: '*'
+      kernel-module-sch-fq-codel: '*'
+      kernel-module-sha1-ce: '*'
+      kernel-module-sha2-ce: '*'
+      kernel-module-sha256-arm64: '*'
+      kernel-module-snd-hda-codec: '*'
+      kernel-module-snd-hda-codec-hdmi: '*'
+      kernel-module-snd-hda-core: '*'
+      kernel-module-snd-hda-tegra: '*'
+      kernel-module-snd-soc-audio-graph-card: '*'
+      kernel-module-snd-soc-simple-card-utils: '*'
+      kernel-module-snd-soc-tegra-audio-graph-card: '*'
+      kernel-module-snd-soc-tegra-pcm: '*'
+      kernel-module-snd-soc-tegra-utils: '*'
+      kernel-module-snd-soc-tegra186-arad: '*'
+      nv-kernel-module-snd-soc-tegra186-asrc: '*'
+      nv-kernel-module-snd-soc-tegra186-dspk: '*'
+      nv-kernel-module-snd-soc-tegra210-admaif: '*'
+      nv-kernel-module-snd-soc-tegra210-adx: '*'
+      nv-kernel-module-snd-soc-tegra210-ahub: '*'
+      nv-kernel-module-snd-soc-tegra210-amx: '*'
+      nv-kernel-module-snd-soc-tegra210-dmic: '*'
+      nv-kernel-module-snd-soc-tegra210-i2s: '*'
+      nv-kernel-module-snd-soc-tegra210-mixer: '*'
+      nv-kernel-module-snd-soc-tegra210-mvc: '*'
+      nv-kernel-module-snd-soc-tegra210-ope: '*'
+      nv-kernel-module-snd-soc-tegra210-sfc: '*'
+      kernel-module-spi-tegra114: '*'
+      kernel-module-spidev: '*'
+      kernel-module-tegra-aconnect: '*'
+      kernel-module-tegra-bpmp-thermal: '*'
+      kernel-module-tegra-cactmon-mc-all: '*'
+      kernel-module-tegra-dce: '*'
+      nv-kernel-module-tegra-drm: '*'
+      kernel-module-tegra-wmark: '*'
+      kernel-module-tegra-xudc: '*'
+      kernel-module-tegra210-adma: '*'
+      kernel-module-tegra234-aon: '*'
+      kernel-module-tegra234-oc-event: '*'
+      kernel-module-thermal-trip-event: '*'
+      kernel-module-tsecriscv: '*'
+      swupdate: '*'
+      tegra-redundant-boot-base: '*'
+
+      # L4T GPU userspace + boot-time daemons. tegra-firmware-tegra234 (the
+      # ga10b kernel firmware blobs) is delivered via
+      # packagegroup-avocado-tegra-rootfs in the rootfs erofs base, *not*
+      # here, because the kernel firmware loader returns -40 (ELOOP) when
+      # reading firmware files through the sysext /usr overlay.
+      cuda-cudart: '*'
+      tegra-configs-udev: '*'
+      tegra-libraries-cuda: '*'
+      tegra-nvphs: '*'
+      tegra-nvpower: '*'
+      tegra-nvsciipc: '*'
+      tegra-nvstartup: '*'
+
+    # 5.15 (linux-jammy-nvidia-tegra): NVIDIA downstream Realtek shim for the
+    # M.2 wifi card; mainline rtw88 isn't built for this kernel.
+    kernel-5.15.*:
+      packages:
+        nv-kernel-module-rtl8822ce: '*'
+        tegra-firmware-rtl8822: '*'
+
+    # 6.6 (linux-yocto, default): upstream rtw88 family for the 8822CE, and
+    # drm-display-helper as a separate module.
+    kernel-6.6.*:
+      packages:
+        kernel-module-drm-display-helper: '*'
+        kernel-module-rtw88-8822c: '*'
+        kernel-module-rtw88-8822ce: '*'
+        kernel-module-rtw88-core: '*'
+        kernel-module-rtw88-pci: '*'
+        linux-firmware-rtl8822: '*'
+
+sdk:
+  image: docker.io/avocadolinux/sdk:{{ env.AVOCADO_DISTRO_RELEASE }}
