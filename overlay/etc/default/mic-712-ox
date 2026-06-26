@@ -1,0 +1,32 @@
+# Configuration for the mic-712-ox carrier tooling (sourced by /usr/bin/mic-712-ox).
+# Uncomment + edit to override the defaults shown.
+
+# --- PoE (IP808 PSE) ---
+#MIC712_POE_BUS=1
+#MIC712_POE_ADDR=0x74
+
+# --- CAN ---
+# Space-separated interface list; add can1 if the second controller is wired.
+#MIC712_CAN_IFACES="can0"
+#MIC712_CAN_BITRATE=125000
+
+# --- Audio (rt5640 on I2S4) ---
+#MIC712_AUDIO_CARD=APE
+#MIC712_AUDIO_IF=I2S4
+
+# --- Fan sync (mirror primary PWM onto secondary) ---
+#MIC712_FAN_SRC="/sys/devices/platform/pwm-fan/hwmon/hwmon*/pwm1"
+#MIC712_FAN_DST="/sys/devices/platform/pwm5-fan/hwmon/hwmon*/pwm1"
+#MIC712_FAN_INTERVAL=1
+
+# --- Nuvoton M031 MCU (advanced; OFF by default) ---
+# The factory image drives MCU_PROG_EN + MCU1_RST low and holds them. The MCU's
+# role is not needed for NICs/PoE/CAN/audio and the low-on-reset semantics are
+# board-specific, so carrier-init leaves it alone. Set to 1 to hold the lines at
+# boot (matches the factory image); enable mic-712-ox-mcu.service to persist it.
+#MIC712_ENABLE_MCU=0
+#MIC712_MCU_PROG_EN_LINE=PQ.05
+#MIC712_MCU_RST_LINE=PP.06
+
+# --- mini-PCIe ---
+#MIC712_MPCIE_RST_LINE=PK.03

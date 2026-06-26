@@ -1,0 +1,17 @@
+[Unit]
+Description=MIC-712-OX PoE bring-up (IP808 PSE, 8 ports)
+Documentation=https://github.com/avocadolinux/avocado-os
+# The IP808 PSE hangs off i2c-1; settle udev so /dev/i2c-* exists. poe init
+# also polls the bus, so this is a soft ordering, not a hard dependency.
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+ConditionPathExistsGlob=/dev/i2c-*
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# PSE config is volatile -- re-applied on every boot, not just on merge.
+ExecStart=/usr/bin/mic-712-ox poe init
+
+[Install]
+WantedBy=multi-user.target

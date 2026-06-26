@@ -1,0 +1,20 @@
+[Unit]
+Description=MIC-712-OX Nuvoton M031 MCU line hold (advanced, opt-in)
+Documentation=https://github.com/avocadolinux/avocado-os
+# NOT enabled by default. The factory image drives MCU_PROG_EN + MCU1_RST low
+# and holds them via a daemon. The MCU's function is board-specific and not
+# required for NICs/PoE/CAN/audio, so this ships disabled. Enable with:
+#   systemctl enable --now mic-712-ox-mcu.service
+# (or set MIC712_ENABLE_MCU=1 in /etc/default/mic-712-ox to drive it from
+# carrier-init instead). `mic-712-ox mcu enable` daemonizes gpioset to hold the
+# SoC lines (they would otherwise revert when the setter exits).
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/mic-712-ox mcu enable
+ExecStop=/usr/bin/mic-712-ox mcu release
+
+[Install]
+WantedBy=multi-user.target

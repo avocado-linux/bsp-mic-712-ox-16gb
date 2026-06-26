@@ -1,0 +1,15 @@
+[Unit]
+Description=MIC-712-OX audio routing (rt5640 on I2S4)
+Documentation=https://github.com/avocadolinux/avocado-os
+# Best-effort: applies the ALSA mixer routing the rt5640 codec needs. Only
+# relevant if the analog audio jacks are used. After sound is up.
+After=sound.target systemd-udev-settle.service
+Wants=sound.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/mic-712-ox audio
+
+[Install]
+WantedBy=multi-user.target

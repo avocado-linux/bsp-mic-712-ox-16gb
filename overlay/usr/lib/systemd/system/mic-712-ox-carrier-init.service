@@ -1,0 +1,15 @@
+[Unit]
+Description=MIC-712-OX carrier bring-up (CAN transceiver + interface)
+Documentation=https://github.com/avocadolinux/avocado-os
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Releases the CAN transceiver (tca9554 CAN_RST/CAN_TX_EN, which latch in the
+# expander) and brings up the CAN interface(s). Honors MIC712_ENABLE_MCU.
+ExecStart=/usr/bin/mic-712-ox carrier-init
+
+[Install]
+WantedBy=multi-user.target
