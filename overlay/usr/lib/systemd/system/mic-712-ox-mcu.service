@@ -1,6 +1,6 @@
 [Unit]
 Description=MIC-712-OX Nuvoton M031 MCU line hold (advanced, opt-in)
-Documentation=https://github.com/avocadolinux/avocado-os
+Documentation=https://github.com/avocado-linux/bsp-mic-712-ox-16gb
 # NOT enabled by default. The factory image drives MCU_PROG_EN + MCU1_RST low
 # and holds them via a daemon. The MCU's function is board-specific and not
 # required for NICs/PoE/CAN/audio, so this ships disabled. Enable with:

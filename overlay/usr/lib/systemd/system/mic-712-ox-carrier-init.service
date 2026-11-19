@@ -1,6 +1,6 @@
 [Unit]
 Description=MIC-712-OX carrier bring-up (CAN transceiver + interface)
-Documentation=https://github.com/avocadolinux/avocado-os
+Documentation=https://github.com/avocado-linux/bsp-mic-712-ox-16gb
 After=systemd-udev-settle.service
 Wants=systemd-udev-settle.service
 
